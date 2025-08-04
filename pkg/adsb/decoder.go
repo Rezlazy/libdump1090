@@ -1,6 +1,7 @@
-package libdump1090
+package adsb
 
 import (
+	"errors"
 	"math"
 )
 
@@ -76,12 +77,17 @@ type ADSBResult struct {
 	ValidCallsign bool
 }
 
-var (
-	decoderOut       *ADSBResult
-	decoderRxLat     float64
-	decoderRxLon     float64
-	decoderGotResult bool
-)
+// Decoder provides ADS-B frame decoding capabilities.
+type Decoder struct {
+	rxLat float64
+	rxLon float64
+}
+
+// NewDecoder creates a new Decoder configured with receiver coordinates.
+func NewDecoder(rxLat, rxLon float64) *Decoder {
+	modesInitConfig()
+	return &Decoder{rxLat: rxLat, rxLon: rxLon}
+}
 
 var modesChecksumTable = [112]uint32{
 	0x3935ea, 0x1c9af5, 0xf1b77e, 0x78dbbf, 0xc397db, 0x9e31e9, 0xb0e2f0, 0x587178,
@@ -458,7 +464,7 @@ func computeMagnitudeVector() {
 	}
 }
 
-func detectModeS(m []uint16, mlen int) {
+func detectModeS(m []uint16, mlen int, d *Decoder, out *ADSBResult, gotResult *bool) {
 	var (
 		bits [modesLongMsgBits]byte
 		msg  [modesLongMsgBits / 2]byte
@@ -550,9 +556,9 @@ func detectModeS(m []uint16, mlen int) {
 					mm.phaseCorrected = true
 				}
 			}
-			useModesMessage(&mm)
+			useModesMessage(d, out, gotResult, &mm)
 		}
-		if !decoderGotResult && !useCorrection {
+		if !*gotResult && !useCorrection {
 			j--
 			useCorrection = true
 		} else {
@@ -598,28 +604,28 @@ func decodeCPRRelative(mm *modesMessage, rxLat, rxLon float64) (lat, lon float64
 	return lat, lon, true
 }
 
-func useModesMessage(mm *modesMessage) {
-	if decoderGotResult || decoderOut == nil || !mm.crcok {
+func useModesMessage(d *Decoder, out *ADSBResult, gotResult *bool, mm *modesMessage) {
+	if *gotResult || out == nil || !mm.crcok {
 		return
 	}
-	*decoderOut = ADSBResult{}
-	decoderOut.ICAO = uint32(mm.aa1<<16 | mm.aa2<<8 | mm.aa3)
+	*out = ADSBResult{}
+	out.ICAO = uint32(mm.aa1<<16 | mm.aa2<<8 | mm.aa3)
 	if mm.msgtype == 17 {
 		if mm.metype >= 1 && mm.metype <= 4 {
-			decoderOut.Callsign = string(mm.flight[:8])
-			decoderOut.ValidCallsign = true
+			out.Callsign = string(mm.flight[:8])
+			out.ValidCallsign = true
 		}
 		if mm.metype >= 9 && mm.metype <= 18 {
-			decoderOut.Altitude = mm.altitude
-			decoderOut.ValidAltitude = true
-			if lat, lon, ok := decodeCPRRelative(mm, decoderRxLat, decoderRxLon); ok {
-				decoderOut.Lat = lat
-				decoderOut.Lon = lon
-				decoderOut.ValidPosition = true
+			out.Altitude = mm.altitude
+			out.ValidAltitude = true
+			if lat, lon, ok := decodeCPRRelative(mm, d.rxLat, d.rxLon); ok {
+				out.Lat = lat
+				out.Lon = lon
+				out.ValidPosition = true
 			}
 		}
 	}
-	decoderGotResult = true
+	*gotResult = true
 }
 
 func modesInitConfig() {
@@ -643,27 +649,18 @@ func modesInit() {
 	}
 }
 
-// DecodeAdsbFrame decodes a single frame of raw IQ samples.
-func DecodeAdsbFrame(iqSamples []byte, receiverLat, receiverLon float64) (ADSBResult, bool) {
-	if len(iqSamples) == 0 {
-		return ADSBResult{}, false
+// DecodeFrame decodes a single Mode S frame provided as raw bytes.
+func (d *Decoder) DecodeFrame(frame []byte) (ADSBResult, error) {
+	if len(frame) == 0 {
+		return ADSBResult{}, errors.New("empty frame")
 	}
-	if modes.data == nil {
-		modesInitConfig()
-		modesInit()
-	}
-	bytes := len(iqSamples)
-	if uint32(bytes) > modes.dataLen {
-		bytes = int(modes.dataLen)
-	}
-	copy(modes.data, iqSamples[:bytes])
-	modes.dataLen = uint32(bytes)
-	computeMagnitudeVector()
+	var mm modesMessage
+	decodeModesMessage(&mm, frame)
 	var out ADSBResult
-	decoderOut = &out
-	decoderRxLat = receiverLat
-	decoderRxLon = receiverLon
-	decoderGotResult = false
-	detectModeS(modes.magnitude, int(modes.dataLen)/2)
-	return out, decoderGotResult
+	gotResult := false
+	useModesMessage(d, &out, &gotResult, &mm)
+	if !gotResult {
+		return ADSBResult{}, errors.New("unable to decode frame")
+	}
+	return out, nil
 }
