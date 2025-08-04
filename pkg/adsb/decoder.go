@@ -63,8 +63,6 @@ type modesState struct {
 	aggressive bool
 }
 
-var modes modesState
-
 // ADSBResult contains the decoded information from a single frame.
 type ADSBResult struct {
 	ICAO          uint32
@@ -81,12 +79,15 @@ type ADSBResult struct {
 type Decoder struct {
 	rxLat float64
 	rxLon float64
+	modes modesState
 }
 
 // NewDecoder creates a new Decoder configured with receiver coordinates.
 func NewDecoder(rxLat, rxLon float64) *Decoder {
-	modesInitConfig()
-	return &Decoder{rxLat: rxLat, rxLon: rxLon}
+	d := &Decoder{rxLat: rxLat, rxLon: rxLon}
+	modesInitConfig(&d.modes)
+	d.initMaglut()
+	return d
 }
 
 var modesChecksumTable = [112]uint32{
@@ -340,7 +341,7 @@ func cprDlonFunction(lat float64, isodd int) float64 {
 	return 360.0 / float64(cprNFunction(lat, isodd))
 }
 
-func decodeModesMessage(mm *modesMessage, msg []byte) {
+func (d *Decoder) decodeModesMessage(mm *modesMessage, msg []byte) {
 	copy(mm.msg[:], msg[:modesLongMsgBytes])
 	msg = mm.msg[:]
 	mm.msgtype = int(msg[0] >> 3)
@@ -349,16 +350,22 @@ func decodeModesMessage(mm *modesMessage, msg []byte) {
 	crc2 := modesChecksum(msg, mm.msgbits)
 	mm.errorbit = -1
 	mm.crcok = mm.crc == crc2
-	if !mm.crcok && modes.fixErrors && (mm.msgtype == 11 || mm.msgtype == 17) {
+	if !mm.crcok && d.modes.fixErrors && (mm.msgtype == 11 || mm.msgtype == 17) {
 		if mm.errorbit = fixSingleBitErrors(msg, mm.msgbits); mm.errorbit != -1 {
 			mm.crc = modesChecksum(msg, mm.msgbits)
 			mm.crcok = true
-		} else if modes.aggressive && mm.msgtype == 17 {
+		} else if d.modes.aggressive && mm.msgtype == 17 {
 			if mm.errorbit = fixTwoBitsErrors(msg, mm.msgbits); mm.errorbit != -1 {
 				mm.crc = modesChecksum(msg, mm.msgbits)
 				mm.crcok = true
 			}
 		}
+	}
+	if d.modes.checkCRC && !mm.crcok {
+		mm.msgtype = 0
+	}
+	if !mm.crcok {
+		return
 	}
 	mm.ca = int(msg[0] & 7)
 	mm.aa1 = int(msg[1])
@@ -372,8 +379,8 @@ func decodeModesMessage(mm *modesMessage, msg []byte) {
 	a := ((int(msg[3]&0x80) >> 5) | (int(msg[2]&0x02) >> 0) | (int(msg[2]&0x08) >> 3))
 	b := ((int(msg[3]&0x02) << 1) | (int(msg[3]&0x08) >> 2) | (int(msg[3]&0x20) >> 5))
 	c := ((int(msg[2]&0x01) << 2) | (int(msg[2]&0x04) >> 1) | (int(msg[2]&0x10) >> 4))
-	d := ((int(msg[3]&0x01) << 2) | (int(msg[3]&0x04) >> 1) | (int(msg[3]&0x10) >> 4))
-	mm.identity = a*1000 + b*100 + c*10 + d
+	digitD := ((int(msg[3]&0x01) << 2) | (int(msg[3]&0x04) >> 1) | (int(msg[3]&0x10) >> 4))
+	mm.identity = a*1000 + b*100 + c*10 + digitD
 	if mm.msgtype == 0 || mm.msgtype == 4 || mm.msgtype == 16 || mm.msgtype == 20 {
 		mm.altitude = decodeAC13Field(msg, &mm.unit)
 	}
@@ -448,23 +455,10 @@ func detectOutOfPhase(m []uint16, j int) int {
 	return 0
 }
 
-func computeMagnitudeVector() {
-	m := modes.magnitude
-	p := modes.data
-	for j := 0; j < int(modes.dataLen); j += 2 {
-		i := int(p[j]) - 127
-		q := int(p[j+1]) - 127
-		if i < 0 {
-			i = -i
-		}
-		if q < 0 {
-			q = -q
-		}
-		m[j/2] = modes.maglut[i*129+q]
-	}
-}
+// computeMagnitudeVector is no longer used; magnitude is computed directly from
+// raw IQ samples in DecodeIQ.
 
-func detectModeS(m []uint16, mlen int, d *Decoder, out *ADSBResult, gotResult *bool) {
+func detectModeS(d *Decoder, m []uint16, mlen int, results *[]ADSBResult) {
 	var (
 		bits [modesLongMsgBits]byte
 		msg  [modesLongMsgBits / 2]byte
@@ -547,18 +541,18 @@ func detectModeS(m []uint16, mlen int, d *Decoder, out *ADSBResult, gotResult *b
 			useCorrection = false
 			continue
 		}
-		if errors == 0 || (modes.aggressive && errors < 3) {
+		if errors == 0 || (d.modes.aggressive && errors < 3) {
 			var mm modesMessage
-			decodeModesMessage(&mm, msg[:])
+			d.decodeModesMessage(&mm, msg[:])
 			if mm.crcok {
 				j += (modesPreambleUS + (msglen * 8)) * 2
 				if useCorrection {
 					mm.phaseCorrected = true
 				}
 			}
-			useModesMessage(d, out, gotResult, &mm)
+			d.useModesMessage(results, &mm)
 		}
-		if !*gotResult && !useCorrection {
+		if len(*results) == 0 && !useCorrection {
 			j--
 			useCorrection = true
 		} else {
@@ -604,11 +598,11 @@ func decodeCPRRelative(mm *modesMessage, rxLat, rxLon float64) (lat, lon float64
 	return lat, lon, true
 }
 
-func useModesMessage(d *Decoder, out *ADSBResult, gotResult *bool, mm *modesMessage) {
-	if *gotResult || out == nil || !mm.crcok {
+func (d *Decoder) useModesMessage(results *[]ADSBResult, mm *modesMessage) {
+	if !mm.crcok {
 		return
 	}
-	*out = ADSBResult{}
+	var out ADSBResult
 	out.ICAO = uint32(mm.aa1<<16 | mm.aa2<<8 | mm.aa3)
 	if mm.msgtype == 17 {
 		if mm.metype >= 1 && mm.metype <= 4 {
@@ -625,27 +619,55 @@ func useModesMessage(d *Decoder, out *ADSBResult, gotResult *bool, mm *modesMess
 			}
 		}
 	}
-	*gotResult = true
+	*results = append(*results, out)
 }
 
-func modesInitConfig() {
-	modes.fixErrors = true
-	modes.checkCRC = true
-	modes.aggressive = false
+func modesInitConfig(m *modesState) {
+	m.fixErrors = true
+	m.checkCRC = true
+	m.aggressive = false
 }
 
-func modesInit() {
-	modes.dataLen = modesDataLen + (modesFullLen-1)*4
-	modes.data = make([]byte, modes.dataLen)
-	modes.magnitude = make([]uint16, modes.dataLen)
-	modes.maglut = make([]uint16, 129*129)
+// DecodeIQ processes raw interleaved I/Q samples and returns all decoded
+// ADS-B results found within the buffer.
+func (d *Decoder) DecodeIQ(data []byte) []ADSBResult {
+	if len(data) < 2 {
+		return nil
+	}
+	if d.modes.maglut == nil {
+		d.initMaglut()
+	}
+	n := len(data) / 2
+	if cap(d.modes.magnitude) < n {
+		d.modes.magnitude = make([]uint16, n)
+	} else {
+		d.modes.magnitude = d.modes.magnitude[:n]
+	}
+	for j := 0; j < n; j++ {
+		i := int(data[2*j]) - 127
+		q := int(data[2*j+1]) - 127
+		if i < 0 {
+			i = -i
+		}
+		if q < 0 {
+			q = -q
+		}
+		d.modes.magnitude[j] = d.modes.maglut[i*129+q]
+	}
+	var results []ADSBResult
+	detectModeS(d, d.modes.magnitude, n, &results)
+	return results
+}
+
+func (d *Decoder) initMaglut() {
+	if d.modes.maglut != nil {
+		return
+	}
+	d.modes.maglut = make([]uint16, 129*129)
 	for i := 0; i <= 128; i++ {
 		for q := 0; q <= 128; q++ {
-			modes.maglut[i*129+q] = uint16(math.Round(math.Sqrt(float64(i*i+q*q)) * 360))
+			d.modes.maglut[i*129+q] = uint16(math.Round(math.Sqrt(float64(i*i+q*q)) * 360))
 		}
-	}
-	for i := range modes.data {
-		modes.data[i] = 127
 	}
 }
 
@@ -655,12 +677,11 @@ func (d *Decoder) DecodeFrame(frame []byte) (ADSBResult, error) {
 		return ADSBResult{}, errors.New("empty frame")
 	}
 	var mm modesMessage
-	decodeModesMessage(&mm, frame)
-	var out ADSBResult
-	gotResult := false
-	useModesMessage(d, &out, &gotResult, &mm)
-	if !gotResult {
+	d.decodeModesMessage(&mm, frame)
+	var results []ADSBResult
+	d.useModesMessage(&results, &mm)
+	if len(results) == 0 {
 		return ADSBResult{}, errors.New("unable to decode frame")
 	}
-	return out, nil
+	return results[0], nil
 }
