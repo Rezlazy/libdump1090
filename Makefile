@@ -1,15 +1,21 @@
-CFLAGS?=-O2 -g -Wall -W $(shell pkg-config --cflags librtlsdr)
-LDLIBS+=$(shell pkg-config --libs librtlsdr) -lpthread -lm
 CC?=gcc
-PROGNAME=dump1090
+CFLAGS?=-O2 -g -Wall -W -fPIC $(shell pkg-config --cflags librtlsdr)
+LDFLAGS?=$(shell pkg-config --libs librtlsdr) -lpthread -lm
+OBJS=dump1090.o anet.o
 
-all: dump1090
+all: libdump1090.a libdump1090.so dump1090
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $<
 
-dump1090: dump1090.o anet.o
-	$(CC) -g -o dump1090 dump1090.o anet.o $(LDFLAGS) $(LDLIBS)
+libdump1090.a: $(OBJS)
+	ar rcs $@ $(OBJS)
+
+libdump1090.so: $(OBJS)
+	$(CC) -shared -o $@ $(OBJS) $(LDFLAGS)
+
+dump1090: main.o libdump1090.a
+	$(CC) $(CFLAGS) -o $@ main.o libdump1090.a $(LDFLAGS)
 
 clean:
-	rm -f *.o dump1090
+	rm -f $(OBJS) main.o libdump1090.a libdump1090.so dump1090

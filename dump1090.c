@@ -45,6 +45,7 @@
 #include <sys/select.h>
 #include "rtl-sdr.h"
 #include "anet.h"
+#include "dump1090.h"
 
 #define MODES_DEFAULT_RATE         2000000
 #define MODES_DEFAULT_FREQ         1090000000
@@ -2501,7 +2502,7 @@ void backgroundTasks(void) {
     }
 }
 
-int main(int argc, char **argv) {
+int dump1090_run(int argc, char **argv) {
     int j;
 
     /* Set sane defaults. */
